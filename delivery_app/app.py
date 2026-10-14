@@ -76,3 +76,6 @@ def handle(request: dict) -> dict:
         )
     entries.sort(key=lambda entry: (entry["charge_minor"], entry["id"]))
     return {"shipment_id": shipment_id, "services": entries}
+
+
+# changerail conformance candidate marker (controller-authored, ci-conf-p2-002)
