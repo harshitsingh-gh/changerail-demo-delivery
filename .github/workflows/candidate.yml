@@ -1,0 +1,68 @@
+# ChangeRail trusted candidate workflow — ONE template for BOTH pipelines.
+run-name: candidate-${{ github.event.inputs.run_key || github.sha }}
+# Rendered per pipeline by changerail.github_ci.render_candidate_workflow:
+# only the five declared placeholders (P2, pytest_unit_delivery,
+# delivery_app/, delivery-candidate-, run_key) are substituted;
+# an unknown placeholder refuses the render. The rendered file is installed
+# once per repository (spec SS2 "Code host and CI"); the controller
+# snapshots and checks the trusted definition before dispatch.
+name: changerail-candidate-P2
+on:
+  push:
+    branches:
+      - changerail/P2/**
+  workflow_dispatch:
+    inputs:
+      run_key:
+        description: "Exact effect key / CI identity carried in this run's inputs (spec SS5)"
+        required: true
+        type: string
+      pipeline:
+        description: "Pipeline identity of the dispatching pipeline"
+        required: true
+        type: string
+      candidate_sha:
+        description: "Immutable candidate commit this run must build"
+        required: true
+        type: string
+      profile:
+        description: "Named test profile to run"
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  candidate:
+    name: candidate-build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: checkout candidate commit
+        # Tag-pinned deliberately: action SHAs are installation-specific
+        # preflight values (spec SS10) pinned at the external install gate
+        # before any measured run; no SHAs are invented locally (D-021).
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: setup python
+        # Same policy: SHA-pinned at the external install gate (spec SS10).
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+      - name: install pinned dependency
+        run: python -m pip install vendor/ pytest==9.1.1
+      - name: run test profile pytest_unit_delivery
+        run: python -m pytest delivery_app/ tests
+      - name: build candidate artifact
+        run: mkdir -p build && cp -r delivery_app/ build/ && python -m compileall build/
+      - name: upload candidate artifact
+        # The artifact is candidate evidence only (spec SS6). Its linkage to
+        # the dispatch identity rides the pinned inputs — the identity field
+        # is run_key and the local run-name carrier is unmodeled
+        # (D-021 F-9, registered under PROD-4-ext).
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: delivery-candidate-candidate
+          path: build/
+          if-no-files-found: error
