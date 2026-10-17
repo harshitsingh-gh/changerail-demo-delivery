@@ -1,17 +1,12 @@
-"""Delivery estimate service: the full SS3 POST /estimate contract on fixture_client 1.0.0.
+"""P2-04 old-code slice: bounded retry and the terminal 503 on v1 timeouts.
 
-Uses the v1 delivery API surface: a kilograms weight argument, an integer
-shipment identifier, naive UTC datetimes, a plain service list, ``[]`` for
-empty availability and ``UpstreamTimeout`` on the manifest-pinned timeout
-destination.
-
-``handle(request) -> dict``: success is the exact SS3 response — the
-shipment id echoed as the exact request string (leading zeros preserved),
-services sorted by (charge_minor, id) with fixed ``...Z`` UTC timestamps;
-empty availability returns an empty list; exhausted upstream timeouts
-return 503 ``{"error": "upstream_timeout"}`` after the bounded retry (at
-most three upstream requests). Errors are ``{"status": <int>=400,
-"body": {...}}``.
+Behavior contract slice (spec SS3): an exhausted upstream timeout maps to the
+fixed HTTP 503 body ``{"error": "upstream_timeout"}`` after the bounded retry
+allowance (at most three upstream requests). Written against fixture_client
+1.0.0, which raises ``UpstreamTimeout``. On fixture_client 2.0.0 the timeout
+exception class is ``UpstreamRequestTimeout`` (and the call signature changed
+to grams/str), so the old handler fails at call time (the seeded P2-04
+incompatibility: upstream timeout exception changes).
 """
 
 from __future__ import annotations
@@ -40,11 +35,7 @@ def handle(request: dict) -> dict:
     if weight_kg is None:
         return _invalid()
     shipment_id = request.get("shipment_id")
-    if (
-        not isinstance(shipment_id, str)
-        or not shipment_id.isdigit()
-        or not 3 <= len(shipment_id) <= 12
-    ):
+    if not isinstance(shipment_id, str) or not shipment_id.isdigit() or not 3 <= len(shipment_id) <= 12:
         return _invalid()
     destination = request.get("destination")
     if not isinstance(destination, str) or not destination:
@@ -62,9 +53,6 @@ def handle(request: dict) -> dict:
             if attempt == MAX_UPSTREAM_ATTEMPTS:
                 return {"status": 503, "body": {"error": "upstream_timeout"}}
     assert services is not None
-
-    if not services:
-        return {"shipment_id": shipment_id, "services": []}
     entries: list[dict[str, object]] = []
     for service in services:
         entries.append(
