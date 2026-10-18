@@ -1,24 +1,25 @@
-"""Delivery estimate service: the full SS3 POST /estimate contract on fixture_client 1.0.0.
+"""P2-03 migrated slice: integer-grams weight argument on the v2 delivery API.
 
-Uses the v1 delivery API surface: a kilograms weight argument, an integer
-shipment identifier, naive UTC datetimes, a plain service list, ``[]`` for
-empty availability and ``UpstreamTimeout`` on the manifest-pinned timeout
-destination.
-
-``handle(request) -> dict``: success is the exact SS3 response — the
-shipment id echoed as the exact request string (leading zeros preserved),
-services sorted by (charge_minor, id) with fixed ``...Z`` UTC timestamps;
-empty availability returns an empty list; exhausted upstream timeouts
-return 503 ``{"error": "upstream_timeout"}`` after the bounded retry (at
-most three upstream requests). Errors are ``{"status": <int>=400,
-"body": {...}}``.
+Behavior contract slice (spec SS3): weight eligibility windows and charges
+are exact integer conversions of the request weight. Migrated to
+fixture_client 2.0.0, whose ``get_services`` takes ``weight_g`` as INTEGER
+GRAMS under a strict type check (the P2-03 change: the weight argument went
+from kilograms to integer grams), so the kilogram-to-gram conversion that
+1.0.0 performed inside the SDK now happens in the application. The same
+call site follows the rest of the v2 envelope: ``shipment_id`` is a string,
+availability comes back as the keyed ``{"services": {id: entry}}`` mapping
+(or the explicit ``ABSENT`` sentinel for empty availability), and each
+``delivery_at`` is a timezone-aware datetime in the service's local offset
+that is normalized to UTC before rendering. The rendered response shape is
+unchanged.
 """
 
 from __future__ import annotations
 
-import fixture_client as fc
+from datetime import timezone
+from decimal import Decimal
 
-MAX_UPSTREAM_ATTEMPTS = 3
+import fixture_client as fc
 
 
 def _invalid() -> dict[str, object]:
@@ -35,43 +36,46 @@ def _parse_weight_kg(raw: object) -> float | None:
     return value if value > 0 else None
 
 
+def _weight_kg_to_g(weight_kg: float) -> int:
+    """Convert a validated kilogram weight to the v2 INTEGER-GRAMS argument.
+
+    The scaling is done on the exact decimal value of the request weight
+    (``str`` of the parsed weight round-trips to the decimal the caller
+    sent), so whole-gram requests like ``"2.500"`` convert to exactly 2500 g
+    with no binary-float drift; a sub-gram remainder truncates toward zero,
+    matching the integer conversion the SDK applied in 1.0.0.
+    """
+    return int(Decimal(str(weight_kg)) * 1000)
+
+
 def handle(request: dict) -> dict:
     weight_kg = _parse_weight_kg(request.get("weight_kg"))
     if weight_kg is None:
         return _invalid()
     shipment_id = request.get("shipment_id")
-    if (
-        not isinstance(shipment_id, str)
-        or not shipment_id.isdigit()
-        or not 3 <= len(shipment_id) <= 12
-    ):
+    if not isinstance(shipment_id, str) or not shipment_id.isdigit() or not 3 <= len(shipment_id) <= 12:
         return _invalid()
     destination = request.get("destination")
     if not isinstance(destination, str) or not destination:
         return _invalid()
 
     client = fc.FixtureClient()
-    services: list[dict[str, object]] | None = None
-    for attempt in range(1, MAX_UPSTREAM_ATTEMPTS + 1):
-        try:
-            services = client.get_services(
-                weight_kg=weight_kg, destination=destination, shipment_id=int(shipment_id)
-            )
-            break
-        except fc.UpstreamTimeout:
-            if attempt == MAX_UPSTREAM_ATTEMPTS:
-                return {"status": 503, "body": {"error": "upstream_timeout"}}
-    assert services is not None
-
-    if not services:
-        return {"shipment_id": shipment_id, "services": []}
+    result = client.get_services(
+        weight_g=_weight_kg_to_g(weight_kg), destination=destination, shipment_id=shipment_id
+    )
+    if result is fc.ABSENT:
+        available: dict[str, dict[str, object]] = {}
+    else:
+        available = result["services"]
     entries: list[dict[str, object]] = []
-    for service in services:
+    for service_id, service in available.items():
         entries.append(
             {
-                "id": service["id"],
+                "id": service_id,
                 "charge_minor": service["charge_minor"],
-                "delivery_at": service["delivery_at"].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "delivery_at": service["delivery_at"]
+                .astimezone(timezone.utc)
+                .strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         )
     entries.sort(key=lambda entry: (entry["charge_minor"], entry["id"]))
