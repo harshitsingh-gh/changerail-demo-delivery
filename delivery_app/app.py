@@ -1,24 +1,20 @@
-"""Delivery estimate service: the full SS3 POST /estimate contract on fixture_client 1.0.0.
+"""P2-05 old-code slice: integer shipment identifier on the v1 delivery API.
 
-Uses the v1 delivery API surface: a kilograms weight argument, an integer
-shipment identifier, naive UTC datetimes, a plain service list, ``[]`` for
-empty availability and ``UpstreamTimeout`` on the manifest-pinned timeout
-destination.
-
-``handle(request) -> dict``: success is the exact SS3 response — the
-shipment id echoed as the exact request string (leading zeros preserved),
-services sorted by (charge_minor, id) with fixed ``...Z`` UTC timestamps;
-empty availability returns an empty list; exhausted upstream timeouts
-return 503 ``{"error": "upstream_timeout"}`` after the bounded retry (at
-most three upstream requests). Errors are ``{"status": <int>=400,
-"body": {...}}``.
+Behavior contract slice (spec SS3): the shipment id is echoed exactly as the
+request string (leading zeros preserved) and follows the documented id
+grammar (digit strings of 3..12 characters); anything else is invalid input.
+Written against fixture_client 1.0.0, whose ``get_services`` takes the
+shipment id as an INTEGER, so this slice coerces the validated digit string
+with ``int()`` for the upstream call while echoing the original string. On
+fixture_client 2.0.0 the identifier is a STRING under a strict type check, so
+the integer coercion fails at call time (the seeded P2-05 incompatibility:
+shipment identifier becomes a string; the rejected shortcut is integer
+coercion in the response or follow-up requests).
 """
 
 from __future__ import annotations
 
 import fixture_client as fc
-
-MAX_UPSTREAM_ATTEMPTS = 3
 
 
 def _invalid() -> dict[str, object]:
@@ -40,31 +36,16 @@ def handle(request: dict) -> dict:
     if weight_kg is None:
         return _invalid()
     shipment_id = request.get("shipment_id")
-    if (
-        not isinstance(shipment_id, str)
-        or not shipment_id.isdigit()
-        or not 3 <= len(shipment_id) <= 12
-    ):
+    if not isinstance(shipment_id, str) or not shipment_id.isdigit() or not 3 <= len(shipment_id) <= 12:
         return _invalid()
     destination = request.get("destination")
     if not isinstance(destination, str) or not destination:
         return _invalid()
 
     client = fc.FixtureClient()
-    services: list[dict[str, object]] | None = None
-    for attempt in range(1, MAX_UPSTREAM_ATTEMPTS + 1):
-        try:
-            services = client.get_services(
-                weight_kg=weight_kg, destination=destination, shipment_id=int(shipment_id)
-            )
-            break
-        except fc.UpstreamTimeout:
-            if attempt == MAX_UPSTREAM_ATTEMPTS:
-                return {"status": 503, "body": {"error": "upstream_timeout"}}
-    assert services is not None
-
-    if not services:
-        return {"shipment_id": shipment_id, "services": []}
+    services = client.get_services(
+        weight_kg=weight_kg, destination=destination, shipment_id=int(shipment_id)
+    )
     entries: list[dict[str, object]] = []
     for service in services:
         entries.append(
