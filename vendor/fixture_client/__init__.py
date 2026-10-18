@@ -1,28 +1,34 @@
-"""fixture_client -- owned synthetic dependency, version 1.0.0 (the v1 API).
+"""fixture_client -- owned synthetic dependency, version 2.0.0 (the v2 API).
 
-This is the OLD released version used by the twelve old-code slices and the
-two example applications. It embeds a self-contained, deterministic,
-in-process fake upstream: all product/service data, rate-limit counters and
-timestamps are fixed fixture data keyed per ``FixtureClient`` instance, so
-every request sequence is reproducible and no wall clock is read. The
-HTTP-server form of the upstream fixture arrives in later build-plan tasks
-(Tasks 4-5); this package performs NO network I/O now.
+This is the NEW released version that the twelve seeded incompatibilities of
+spec SS7 migrate to. It embeds the same self-contained, deterministic,
+in-process fake upstream as 1.0.0 (fixed data, per-instance counters, no wall
+clock, NO network I/O); the HTTP-server form of the upstream fixture arrives
+in later build-plan tasks (Tasks 4-5).
 
-v1 surface (each aspect changes in 2.0.0, one dimension per SS7 case):
+Changed surface (old v1 code calling this package fails AT CALL TIME -- a
+TypeError/AttributeError/KeyError or contract-wrong output -- never at
+import, because old code reaches attributes lazily inside functions):
 
-- ``FixtureClient.lookup_product(product_id) -> dict``          (P1-01: dict result)
-- ``FixtureClient.quote_line(product_id, qty) -> int``          (P1-02: integer minor units)
-- ``FixtureClient.list_products() -> list[dict]``               (P1-03: unpaginated full list)
-- ``ProductNotFound``                                           (P1-04: missing-product exception class)
-- ``RateLimited.retry_after_ms``                                (P1-05: retry metadata in milliseconds)
-- optional top-level ``"currency"`` key on product dicts        (P1-06: currency not nested)
-- ``FixtureClient.get_services(weight_kg, destination, shipment_id: int) -> list[dict]``
-  with naive (UTC-by-convention) ``delivery_at`` datetimes      (P2-01),
-  a plain service list                                          (P2-02),
-  a kilograms weight argument                                   (P2-03),
-  ``UpstreamTimeout``                                           (P2-04),
-  an integer shipment identifier                                (P2-05),
-  and ``[]`` for empty availability                             (P2-06).
+- P1-01: ``lookup_product`` now returns a typed ``Product`` OBJECT (no
+  ``__getitem__``/``__iter__``), not a dict.
+- P1-02: amounts changed from integer minor units to DECIMAL STRINGS:
+  ``quote_line`` returns the exact unrounded ``Decimal`` string and the
+  caller must apply the documented minor-unit half-up rounding.
+- P1-03: ``list_products`` is PAGINATED and returns a typed ``ProductPage``
+  (iterate ``page.items``; follow ``page.next_page``); some products exist
+  only on page two.
+- P1-04: the missing-product exception class is now ``UnknownProductError``
+  (``ProductNotFound`` no longer exists).
+- P1-05: rate-limit retry metadata is now SECONDS (``RateLimited.retry_after_s``).
+- P1-06: the optional currency field moved into nested product ``metadata``.
+- P2-01: ``delivery_at`` is now a TIMEZONE-AWARE datetime expressed in the
+  service's local UTC offset (callers must convert to UTC).
+- P2-02: the service list is now a KEYED mapping ``{"services": {id: ...}}``.
+- P2-03: the weight argument is now INTEGER GRAMS (``weight_g``).
+- P2-04: the upstream timeout exception class is now ``UpstreamRequestTimeout``.
+- P2-05: the shipment identifier is now a STRING (an int raises TypeError).
+- P2-06: empty availability is now the explicit ``ABSENT`` sentinel value.
 
 ``client.trace`` records the request trace (bounded-retry accounting) for the
 protected oracle of build-plan Task 5.
@@ -30,10 +36,10 @@ protected oracle of build-plan Task 5.
 
 from __future__ import annotations
 
-from datetime import datetime
-from decimal import ROUND_HALF_UP, Decimal
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
-__version__ = "1.0.1"
+__version__ = "2.0.1"
 
 # Module-level GLOBAL_TRACE registry (D-025 R1): mirrors EVERY instance
 # trace append, so a caller that rotates fresh FixtureClient instances
@@ -45,7 +51,7 @@ GLOBAL_TRACE: list[dict[str, object]] = []
 
 DEFAULT_CURRENCY = "USD"
 
-_RATE_LIMIT_DELAY_MS = 200
+_RATE_LIMIT_DELAY_S = 0.2
 
 _MINOR_SCALE: dict[str, int] = {"USD": 2, "EUR": 2, "JPY": 0}
 
@@ -64,29 +70,101 @@ class FixtureError(Exception):
     """Base class for fixture_client errors."""
 
 
-class ProductNotFound(FixtureError):
-    """Raised when a product id does not exist (P1-04 v1 class)."""
+class UnknownProductError(FixtureError):
+    """Raised when a product id does not exist (P1-04 v2 class)."""
 
     def __init__(self, product_id: str) -> None:
-        super().__init__(f"product not found: {product_id}")
+        super().__init__(f"unknown product: {product_id}")
         self.product_id = product_id
 
 
 class RateLimited(FixtureError):
-    """Upstream rate limit; retry metadata in MILLISECONDS (P1-05 v1 form)."""
+    """Upstream rate limit; retry metadata in SECONDS (P1-05 v2 form)."""
 
-    def __init__(self, retry_after_ms: int) -> None:
-        super().__init__(f"rate limited; retry after {retry_after_ms} ms")
-        self.retry_after_ms = retry_after_ms
-
-
-class UpstreamTimeout(FixtureError):
-    """Upstream request timed out (P2-04 v1 class)."""
+    def __init__(self, retry_after_s: float) -> None:
+        super().__init__(f"rate limited; retry after {retry_after_s} s")
+        self.retry_after_s = retry_after_s
 
 
-# Fixed catalog data. ``unit_price`` is the raw decimal price (sub-minor
-# precision allowed); the v1 API exposes it pre-rounded to integer minor
-# units, and ``quote_line`` applies decimal half-up rounding internally.
+class UpstreamRequestTimeout(FixtureError):
+    """Upstream request timed out (P2-04 v2 class)."""
+
+
+class _Absent:
+    """Explicit absent-availability sentinel (P2-06 v2 form).
+
+    Deliberately not iterable and truthy: v1 code that tested ``if not
+    services`` or iterated the result fails loudly at call time instead of
+    quietly fabricating availability.
+    """
+
+    _instance: "_Absent | None" = None
+
+    def __new__(cls) -> "_Absent":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "ABSENT"
+
+
+ABSENT = _Absent()
+
+
+class ProductMetadata:
+    """Nested product metadata (P1-06 v2 form: currency lives here, optional)."""
+
+    __slots__ = ("currency",)
+
+    def __init__(self, currency: str | None) -> None:
+        self.currency = currency
+
+    def __repr__(self) -> str:
+        return f"ProductMetadata(currency={self.currency!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, ProductMetadata) and self.currency == other.currency
+
+
+class Product:
+    """Typed catalog product (P1-01 v2 form; deliberately NOT subscriptable)."""
+
+    __slots__ = ("id", "unit_price", "metadata")
+
+    def __init__(self, product_id: str, unit_price: str, metadata: ProductMetadata) -> None:
+        self.id = product_id
+        self.unit_price = unit_price
+        self.metadata = metadata
+
+    def __repr__(self) -> str:
+        return (
+            f"Product(id={self.id!r}, unit_price={self.unit_price!r}, "
+            f"metadata={self.metadata!r})"
+        )
+
+
+class ProductPage:
+    """One page of the paginated catalog (P1-03 v2 form; not iterable itself)."""
+
+    __slots__ = ("items", "page", "pages", "next_page")
+
+    def __init__(
+        self, items: tuple[Product, ...], page: int, pages: int, next_page: int | None
+    ) -> None:
+        self.items = items
+        self.page = page
+        self.pages = pages
+        self.next_page = next_page
+
+    def __repr__(self) -> str:
+        return (
+            f"ProductPage(page={self.page}, pages={self.pages}, "
+            f"next_page={self.next_page}, items={len(self.items)})"
+        )
+
+
+# Fixed catalog data (same underlying catalog as 1.0.0).
 _PRODUCTS: dict[str, dict[str, object]] = {
     "widget": {"unit_price": "1.23", "currency": "USD", "page": 1},
     "gadget": {"unit_price": "4.56", "currency": "USD", "page": 1},
@@ -99,21 +177,20 @@ _PRODUCTS: dict[str, dict[str, object]] = {
     "yen-pin": {"unit_price": "425", "currency": "JPY", "page": 2},
 }
 
-# Fixed delivery data. Service catalog order is deliberately NOT the sorted
-# output order; callers must sort by (charge_minor, id) themselves (P2-02).
-# ``naive_utc`` is the UTC wall time of the fixed delivery instant; the v1
-# API returns it as a NAIVE datetime documented to mean UTC (P2-01).
+# Fixed delivery data. ``utc`` is the delivery instant's UTC wall time and
+# ``offset`` the timezone the v2 API presents it in (P2-01: aware datetimes
+# across multiple offsets, including day boundaries in both directions).
 _SERVICES: tuple[dict[str, object], ...] = (
     {"id": "standard", "base_minor": 400, "per_kg_minor": 80, "min_g": 100, "max_g": 20000,
-     "naive_utc": (2026, 1, 2, 10, 0, 0)},
+     "utc": (2026, 1, 2, 10, 0, 0), "offset": 0},
     {"id": "express", "base_minor": 640, "per_kg_minor": 112, "min_g": 100, "max_g": 2500,
-     "naive_utc": (2026, 1, 2, 7, 30, 0)},
+     "utc": (2026, 1, 2, 7, 30, 0), "offset": -8},
     {"id": "overnight", "base_minor": 900, "per_kg_minor": 200, "min_g": 250, "max_g": 5000,
-     "naive_utc": (2026, 1, 2, 10, 45, 0)},
+     "utc": (2026, 1, 2, 10, 45, 0), "offset": 8},
     {"id": "saver", "base_minor": 425, "per_kg_minor": 60, "min_g": 500, "max_g": 10000,
-     "naive_utc": (2026, 1, 2, 21, 20, 0)},
+     "utc": (2026, 1, 2, 21, 20, 0), "offset": 5.5},
     {"id": "heavy", "base_minor": 600, "per_kg_minor": 24, "min_g": 20000, "max_g": 150000,
-     "naive_utc": (2026, 1, 2, 9, 15, 0)},
+     "utc": (2026, 1, 2, 9, 15, 0), "offset": -5},
 )
 
 _SERVICE_ORDER: tuple[str, ...] = ("standard", "express", "overnight", "saver", "heavy")
@@ -129,19 +206,19 @@ _DESTINATIONS: dict[str, frozenset[str]] = {
 TIMEOUT_DESTINATION = "TIMEOUT"
 
 
-def _round_minor(amount: Decimal, scale: int) -> int:
-    """Convert a major-unit decimal to integer minor units with half-up rounding."""
-    scaled = amount.scaleb(scale)
-    return int(scaled.quantize(Decimal(1), rounding=ROUND_HALF_UP))
+def _aware(spec: dict[str, object]) -> datetime:
+    offset = float(spec["offset"])  # type: ignore[arg-type]
+    tz = timezone(timedelta(hours=offset))
+    utc_fields = spec["utc"]  # type: ignore[arg-type]
+    utc_wall = datetime(*utc_fields)
+    return (utc_wall + timedelta(hours=offset)).replace(tzinfo=tz)
 
 
 class FixtureClient:
     """Deterministic in-process client bound to one request's upstream state.
 
-    Rate limiting is keyed per product id per instance: a product with
-    ``rate_limit_first: n`` answers the first ``n`` lookups/quotes with
-    ``RateLimited`` and succeeds afterwards, so retry behavior is reproducible
-    regardless of call order elsewhere in a process.
+    Rate limiting is keyed per product id per instance (same semantics as
+    1.0.0) so retry behavior is reproducible regardless of call order.
     """
 
     def __init__(self) -> None:
@@ -167,10 +244,10 @@ class FixtureClient:
                     "call": "lookup",
                     "product_id": product_id,
                     "outcome": "rate_limited",
-                    "retry_after_ms": _RATE_LIMIT_DELAY_MS,
+                    "retry_after_s": _RATE_LIMIT_DELAY_S,
                 }
             )
-            raise RateLimited(_RATE_LIMIT_DELAY_MS)
+            raise RateLimited(_RATE_LIMIT_DELAY_S)
 
     def _product_record(self, product_id: str) -> dict[str, object]:
         if not isinstance(product_id, str):
@@ -178,91 +255,92 @@ class FixtureClient:
         record = _PRODUCTS.get(product_id)
         if record is None:
             self._record({"call": "lookup", "product_id": product_id, "outcome": "not_found"})
-            raise ProductNotFound(product_id)
+            raise UnknownProductError(product_id)
         return record
 
-    def lookup_product(self, product_id: str) -> dict[str, object]:
-        """Return the product as a plain DICT with integer ``unit_price_minor``."""
+    def lookup_product(self, product_id: str) -> Product:
+        """Return the product as a typed ``Product`` (P1-01 v2 form).
+
+        ``unit_price`` is the raw DECIMAL STRING (P1-02) and the optional
+        currency lives at ``metadata.currency`` (P1-06; ``None`` means the
+        default currency USD).
+        """
         record = self._product_record(product_id)
         self._rate_gate(product_id, record)
         self._record({"call": "lookup", "product_id": product_id, "outcome": "ok"})
         currency = str(record["currency"])
-        item: dict[str, object] = {
-            "id": product_id,
-            "unit_price_minor": _round_minor(Decimal(str(record["unit_price"])), _MINOR_SCALE[currency]),
-            "scale": _MINOR_SCALE[currency],
-        }
-        if currency != DEFAULT_CURRENCY:
-            # P1-06 v1 form: optional top-level currency, omitted when default.
-            item["currency"] = currency
-        return item
+        metadata = ProductMetadata(None if currency == DEFAULT_CURRENCY else currency)
+        return Product(product_id, str(record["unit_price"]), metadata)
 
-    def quote_line(self, product_id: str, qty: int) -> int:
-        """Return the line amount as INTEGER minor units (SDK-side rounding).
+    def quote_line(self, product_id: str, qty: int) -> str:
+        """Return the exact line amount as a DECIMAL STRING (P1-02 v2 form).
 
-        The v1 SDK applies the documented decimal half-up rounding to the raw
-        price times quantity; callers just add integers.
+        The v2 SDK no longer rounds: the caller must apply the documented
+        currency minor-unit scale with decimal half-up rounding.
         """
         if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0:
             raise ValueError("qty must be a positive integer")
         record = self._product_record(product_id)
         self._rate_gate(product_id, record)
         self._record({"call": "quote_line", "product_id": product_id, "qty": qty, "outcome": "ok"})
-        currency = str(record["currency"])
-        exact = Decimal(str(record["unit_price"])) * qty
-        return _round_minor(exact, _MINOR_SCALE[currency])
+        return str(Decimal(str(record["unit_price"])) * qty)
 
-    def list_products(self) -> list[dict[str, object]]:
-        """Return the FULL unpaginated catalog (P1-03 v1 form), catalog order."""
-        out: list[dict[str, object]] = []
-        for product_id, record in _PRODUCTS.items():
-            currency = str(record["currency"])
-            item: dict[str, object] = {
-                "id": product_id,
-                "unit_price_minor": _round_minor(
-                    Decimal(str(record["unit_price"])), _MINOR_SCALE[currency]
-                ),
-                "scale": _MINOR_SCALE[currency],
-            }
-            if currency != DEFAULT_CURRENCY:
-                item["currency"] = currency
-            out.append(item)
-        self._record({"call": "list_products", "outcome": "ok", "count": len(out)})
-        return out
+    def list_products(self, page: int = 1) -> ProductPage:
+        """Return one page of the paginated catalog (P1-03 v2 form)."""
+        if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+            raise ValueError("page must be a positive integer")
+        total = len(_PRODUCTS)
+        pages = (total + _PAGE_SIZE - 1) // _PAGE_SIZE
+        page = min(page, pages)
+        ids = list(_PRODUCTS)
+        start = (page - 1) * _PAGE_SIZE
+        slice_ids = ids[start : start + _PAGE_SIZE]
+        items = tuple(self._page_product(product_id) for product_id in slice_ids)
+        next_page = page + 1 if page < pages else None
+        self._record(
+            {"call": "list_products", "page": page, "outcome": "ok", "count": len(items)}
+        )
+        return ProductPage(items=items, page=page, pages=pages, next_page=next_page)
+
+    def _page_product(self, product_id: str) -> Product:
+        record = _PRODUCTS[product_id]
+        currency = str(record["currency"])
+        metadata = ProductMetadata(None if currency == DEFAULT_CURRENCY else currency)
+        return Product(product_id, str(record["unit_price"]), metadata)
 
     # -- delivery (P2) -------------------------------------------------------
 
     def get_services(
-        self, weight_kg: float, destination: str, shipment_id: int
-    ) -> list[dict[str, object]]:
-        """Return available services as a plain LIST of dicts.
+        self, weight_g: int, destination: str, shipment_id: str
+    ) -> dict[str, dict[str, object]] | _Absent:
+        """Return available services in the v2 envelope, or ``ABSENT``.
 
-        ``weight_kg`` is kilograms (int/float), ``shipment_id`` is an INTEGER
-        (P2-03/P2-05 v1 forms), ``delivery_at`` is a NAIVE datetime holding
-        the UTC wall time (P2-01 v1 form). Empty availability is ``[]``
-        (P2-06 v1 form). The destination pinned by the fixture manifest as
-        the upstream-timeout trigger raises ``UpstreamTimeout`` on every
-        request (P2-04 v1 class); the app owns the bounded retry.
+        ``weight_g`` is INTEGER GRAMS (P2-03; anything but a non-bool int
+        raises TypeError) and ``shipment_id`` is a STRING (P2-05). The result
+        is a KEYED mapping ``{"services": {id: entry}}`` (P2-02) whose
+        ``delivery_at`` values are TIMEZONE-AWARE datetimes in each service's
+        local offset (P2-01). Empty availability is the explicit ``ABSENT``
+        sentinel (P2-06); the manifest-pinned timeout destination raises
+        ``UpstreamRequestTimeout`` on every request (P2-04).
         """
-        if isinstance(weight_kg, bool) or not isinstance(weight_kg, (int, float)):
-            raise TypeError("weight_kg must be kilograms as int/float")
-        if isinstance(shipment_id, bool) or not isinstance(shipment_id, int):
-            raise TypeError("shipment_id must be an integer (v1 API)")
+        if isinstance(weight_g, bool) or not isinstance(weight_g, int):
+            raise TypeError("weight_g must be integer grams (v2 API)")
+        if not isinstance(shipment_id, str):
+            raise TypeError("shipment_id must be a str (v2 API)")
         if not isinstance(destination, str) or not destination:
             raise TypeError("destination must be a nonempty str")
-        weight_g = int(round(weight_kg * 1000))
         if destination == TIMEOUT_DESTINATION:
             self._record(
                 {"call": "get_services", "destination": destination, "outcome": "timeout"}
             )
-            raise UpstreamTimeout("upstream request timed out")
+            raise UpstreamRequestTimeout("upstream request timed out")
         allowed = _DESTINATIONS.get(destination)
-        if allowed is None:
+        if allowed is None or not allowed:
             self._record(
                 {"call": "get_services", "destination": destination, "outcome": "absent"}
             )
-            return []
-        services: list[dict[str, object]] = []
+            return ABSENT
+        services: dict[str, dict[str, object]] = {}
         for spec in _SERVICES:
             service_id = str(spec["id"])
             if service_id not in allowed:
@@ -270,13 +348,10 @@ class FixtureClient:
             if not (int(spec["min_g"]) <= weight_g <= int(spec["max_g"])):  # noqa: PLR2004
                 continue
             charge = int(spec["base_minor"]) + (weight_g * int(spec["per_kg_minor"])) // 1000
-            services.append(
-                {
-                    "id": service_id,
-                    "charge_minor": charge,
-                    "delivery_at": datetime(*spec["naive_utc"]),  # type: ignore[arg-type]
-                }
-            )
+            services[service_id] = {
+                "charge_minor": charge,
+                "delivery_at": _aware(spec),
+            }
         self._record(
             {
                 "call": "get_services",
@@ -286,4 +361,4 @@ class FixtureClient:
                 "services": len(services),
             }
         )
-        return services
+        return {"services": services}
